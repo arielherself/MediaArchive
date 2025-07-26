@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::LazyLock;
 use std::{collections::HashMap, convert::Infallible, fs::File, io::Read, sync::Arc};
 
@@ -7,6 +8,17 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::Mutex;
 use warp::Filter;
 use toml::Table;
+
+#[derive(Serialize)]
+struct LocalFile {
+    name: String,
+    full_path: String,
+}
+
+#[derive(Serialize)]
+struct LocalFileList {
+    files: Vec<LocalFile>,
+}
 
 #[derive(Serialize)]
 struct Torrent {
@@ -66,6 +78,8 @@ async fn main() {
         Qbit::new(qb_url, credential)
     }));
 
+    let correct_token = CONFIG.get("access-token").unwrap().as_str().unwrap();
+
     let client = Arc::new(Mutex::new(reqwest::Client::new()));
 
     let ping = warp::get().and(warp::path!("ping")).map(|| "pong!");
@@ -78,6 +92,10 @@ async fn main() {
             move |query: HashMap<String, String>| {
                 let client = Arc::clone(&client);
                 async move {
+                    let token = query.get("token").unwrap().to_owned();
+                    if token != correct_token {
+                        return Ok("".to_string());
+                    }
                     let keyword = query.get("keyword").unwrap().to_owned();
 
                     let mut params = HashMap::new();
@@ -106,20 +124,25 @@ async fn main() {
                 let qb = Arc::clone(&qb);
                 async move {
                     let qb_torrent_list = qb.lock().await.get_torrent_list(Default::default()).await.unwrap();
+                    let save_root = CONFIG.get("save-root").unwrap().as_str().unwrap().to_string();
                     let torrent_list = TorrentList {
-                        torrents: qb_torrent_list.into_iter().map(|tr| Torrent {
-                            name: tr.name.unwrap(),
-                            progress: tr.progress.unwrap(),
-                            size: tr.size.unwrap(),
-                            dlspeed: tr.dlspeed.unwrap(),
-                            upspeed: tr.upspeed.unwrap(),
-                            eta: tr.eta.unwrap(),
-                            content_path: tr.content_path.unwrap(),
-                            hash: tr.hash.unwrap(),
-                            status: match tr.state.unwrap() {
-                                qbit_rs::model::State::Uploading => 0,
-                                qbit_rs::model::State::Downloading => 1,
-                                _ => 2,
+                        torrents: qb_torrent_list.into_iter().map(|tr| {
+                            let full_path = Path::new(tr.content_path.as_ref().unwrap());
+                            let rel_path = Path::new(full_path).strip_prefix(&save_root).unwrap_or(Path::new(""));
+                            Torrent {
+                                name: tr.name.unwrap(),
+                                progress: tr.progress.unwrap(),
+                                size: tr.size.unwrap(),
+                                dlspeed: tr.dlspeed.unwrap(),
+                                upspeed: tr.upspeed.unwrap(),
+                                eta: tr.eta.unwrap(),
+                                content_path: rel_path.to_string_lossy().to_string(),
+                                hash: tr.hash.unwrap(),
+                                status: match tr.state.unwrap() {
+                                    qbit_rs::model::State::Uploading | qbit_rs::model::State::StalledUP => 0,
+                                    qbit_rs::model::State::Downloading | qbit_rs::model::State::CheckingUP | qbit_rs::model::State::CheckingDL | qbit_rs::model::State::Allocating | qbit_rs::model::State::MetaDL | qbit_rs::model::State::StalledDL => 1,
+                                    _ => 2,
+                                }
                             }
                         }).collect()
                     };
@@ -138,6 +161,10 @@ async fn main() {
                 let client = Arc::clone(&client);
                 let qb = Arc::clone(&qb);
                 async move {
+                    let token = query.get("token").unwrap().to_owned();
+                    if token != correct_token {
+                        return Ok("".to_string());
+                    }
                     let id = query.get("id").unwrap().to_owned();
                     let downhash = query.get("downhash").unwrap().to_owned();
                     let response = client.lock().await
@@ -161,8 +188,8 @@ async fn main() {
                         .sequential_download("true".to_string())
                         .build()
                     ).await {
-                        Ok(()) => Ok::<String, Infallible>(r#"{status: "success", message: ""}"#.to_string()),
-                        Err(e) => Ok(format!(r#"{{status: "error", message: "{e}"}}"#)),
+                        Ok(()) => Ok::<String, Infallible>(r#"{"status": "success", "message": ""}"#.to_string()),
+                        Err(e) => Ok(format!(r#"{{"status": "error", "message": "{e}"}}"#)),
                     }
                 }
             }
@@ -176,15 +203,49 @@ async fn main() {
             move |query: HashMap<String, String>| {
                 let qb = Arc::clone(&qb);
                 async move {
+                    let token = query.get("token").unwrap().to_owned();
+                    if token != correct_token {
+                        return Ok("".to_string());
+                    }
                     let hash = query.get("hash").unwrap().to_owned();
                     match qb.lock().await.delete_torrents(vec![hash], true).await {
-                        Ok(()) => Ok::<String, Infallible>(r#"{status: "success", message: ""}"#.to_string()),
-                        Err(e) => Ok(format!(r#"{{status: "error", message: "{e}"}}"#)),
+                        Ok(()) => Ok::<String, Infallible>(r#"{"status": "success", "message": ""}"#.to_string()),
+                        Err(e) => Ok(format!(r#"{{"status": "error", "message": "{e}"}}"#)),
                     }
                 }
             }
         });
 
-    warp::serve(ping.or(search).or(torrent_list).or(download).or(stop_download))
+    let list_files = warp::get()
+        .and(warp::path!("list"))
+        .and(warp::query::<HashMap<String, String>>())
+        .map(move |query: HashMap<String, String>| {
+            let token = query.get("token").unwrap().to_owned();
+            if token != correct_token {
+                return "".to_string();
+            }
+
+            let save_root = Path::new(CONFIG.get("save-root").unwrap().as_str().unwrap());
+            let rel_path = Path::new(query.get("path").unwrap());
+            let full_path = save_root.join(rel_path);
+            let paths = std::fs::read_dir(full_path).unwrap();
+            let local_files = LocalFileList {
+                files: paths.map(|file| {
+                    let full_path = file.as_ref().unwrap().path();
+                    let rel_path = full_path.strip_prefix(save_root).unwrap();
+                    LocalFile {
+                        name: file.as_ref().unwrap().file_name().to_string_lossy().to_string(),
+                        full_path: rel_path.to_string_lossy().to_string(),
+                    }
+                }).collect()
+            };
+            serde_json::to_string(&local_files).unwrap()
+        });
+
+    let sync = warp::get()
+        .and(warp::path("sync"))
+        .and(warp::fs::dir(CONFIG.get("save-root").unwrap().as_str().unwrap().to_string()));
+
+    warp::serve(ping.or(search).or(torrent_list).or(download).or(stop_download).or(list_files).or(sync).with(warp::cors().allow_any_origin()))
         .run(([127, 0, 0, 1], 3000)).await;
 }
