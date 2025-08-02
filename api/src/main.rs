@@ -227,7 +227,10 @@ async fn main() {
 
             let save_root = Path::new(CONFIG.get("save-root").unwrap().as_str().unwrap());
             let rel_path = Path::new(query.get("path").unwrap());
-            let full_path = save_root.join(rel_path);
+            let mut full_path = save_root.join(rel_path);
+            if !std::fs::metadata(&full_path).unwrap().is_dir() {
+                full_path = full_path.parent().unwrap().to_path_buf();
+            }
             let paths = std::fs::read_dir(full_path).unwrap();
             let local_files = LocalFileList {
                 files: paths.map(|file| {
