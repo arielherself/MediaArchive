@@ -144,7 +144,7 @@ async fn main() {
                                     _ => 2,
                                 }
                             }
-                        }).collect()
+                        }).filter(|t| !t.content_path.is_empty()).collect()
                     };
                     Ok::<String, Infallible>(serde_json::to_string(&torrent_list).unwrap())
                 }
